@@ -1790,7 +1790,7 @@ class ContractRunner {
       // сегментов задаёт платформа, и хардкод СуммаРазвернутыйКонечныйОстатокДт
       // давал «провал» на конфигурации, где публикуется и исполняется
       // СуммаКонечныйРазвернутыйОстатокДт. Проверяется pre-flight, а не написание.
-      const schema = await tool(this.client, "get_metadata_structure", {
+      const schema = await rawTool(this.client, "get_metadata_structure", {
         type: accountingRegister.fullName,
         include_virtual_tables: true,
       });
@@ -3115,6 +3115,20 @@ class ContractRunner {
   }
 
   async queryExamplesTests() {
+    // Сид-источник не хардкодится: ПланСчетов.Хозрасчетный есть только в
+    // бухгалтерских конфигурациях, и на ЗУП пять кейсов падали «объект не
+    // найден» (дефект фикстуры, не сервера). Берётся первый план счетов, а без
+    // планов счетов — первый справочник: Код и Наименование есть у обоих видов.
+    let seedSource = "";
+    for (const kind of ["ПланСчетов", "Справочник"]) {
+      const found = await rawTool(this.client, "list_metadata_objects", {
+        kinds: [kind],
+        limit: 1,
+        include_details: false,
+      });
+      const item = (found?.objects ?? []).find((o) => o?.full_name);
+      if (item) { seedSource = item.full_name; break; }
+    }
     // Маркеры уникальны для прогона; suffix identifier-safe (только цифры).
     const ts = new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14);
     const aliasName = `МАРКЕРАЛИАС${ts}`;
@@ -3123,12 +3137,12 @@ class ContractRunner {
     const paramValue = `ZZZ_${ts}`;
     const seedQuery =
       `ВЫБРАТЬ ПЕРВЫЕ 3 Счета.Код КАК ${aliasName} ` +
-      `ИЗ ПланСчетов.Хозрасчетный КАК Счета ` +
+      `ИЗ ${seedSource} КАК Счета ` +
       `ГДЕ Счета.Наименование <> "${markerLiteral}" И Счета.Код <> &${paramName}`;
     const seedArgs = { query: seedQuery, parameters: { [paramName]: paramValue }, limit: 3 };
     // Маркер-литерал/алиас/имя параметра из skeleton исчезают по построению,
     // поэтому маркерная группа ищется по устойчивым фрагментам канонического skeleton.
-    const SKELETON_FRAGMENTS = ["ПланСчетов.Хозрасчетный", "ПЕРВЫЕ 3", "&Строка1"];
+    const SKELETON_FRAGMENTS = [seedSource, "ПЕРВЫЕ 3", "&Строка1"];
     const findMarkerGroup = (result) =>
       (result.examples || []).find((ex) =>
         SKELETON_FRAGMENTS.every((frag) => String(ex.skeleton || "").includes(frag)));
@@ -3153,11 +3167,11 @@ class ContractRunner {
       const seed = await okTool(this.client, "run_1c_query", seedArgs);
       assert(Array.isArray(seed.rows) && seed.rows.length >= 1, "seed query must return rows");
       const result = await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20 });
+        { object: seedSource, days_back: 7, limit: 20 });
       const group = findMarkerGroup(result);
       assert(group, "marker skeleton group must be present after seed");
       assert(typeof group.skeleton === "string" && group.skeleton.length > 0, "skeleton must be a non-empty string");
-      assert(Array.isArray(group.tables) && group.tables.includes("ПланСчетов.Хозрасчетный"),
+      assert(Array.isArray(group.tables) && group.tables.includes(seedSource),
         "tables must include seeded object");
       assert(typeof group.uses === "number" && group.uses >= 1, "uses must be >= 1");
       assert(typeof group.last_used === "string" && group.last_used.length > 0, "last_used must be present");
@@ -3168,7 +3182,7 @@ class ContractRunner {
     await this.test("query_examples.anonymization_no_leak", async () => {
       if (!enabled) return { skipped: "query_examples disabled" };
       const result = await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20 });
+        { object: seedSource, days_back: 7, limit: 20 });
       const json = JSON.stringify(result);
       for (const marker of [aliasName, paramName, markerLiteral, paramValue]) {
         assert(!json.includes(marker), `marker "${marker}" must not leak into response`);
@@ -3183,11 +3197,11 @@ class ContractRunner {
     await this.test("query_examples.dedup_increments_uses", async () => {
       if (!enabled) return { skipped: "query_examples disabled" };
       const before = findMarkerGroup(await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20 }));
+        { object: seedSource, days_back: 7, limit: 20 }));
       assert(before, "marker group must exist before re-seed");
       await okTool(this.client, "run_1c_query", seedArgs);
       const after = findMarkerGroup(await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20 }));
+        { object: seedSource, days_back: 7, limit: 20 }));
       assert(after, "marker group must exist after re-seed");
       assert(after.uses > before.uses, `uses must grow (before=${before.uses}, after=${after.uses})`);
       return { before: before.uses, after: after.uses };
@@ -3218,7 +3232,7 @@ class ContractRunner {
 
     // Кейс 6: shape ответа run_1c_query не изменился.
     await this.test("query_examples.run_1c_query_shape_unchanged", async () => {
-      const q = await okTool(this.client, "run_1c_query", { query: "ВЫБРАТЬ ПЕРВЫЕ 1 Счета.Код КАК Код ИЗ ПланСчетов.Хозрасчетный КАК Счета", limit: 1 });
+      const q = await okTool(this.client, "run_1c_query", { query: `ВЫБРАТЬ ПЕРВЫЕ 1 Счета.Код КАК Код ИЗ ${seedSource} КАК Счета`, limit: 1 });
       for (const field of ["columns", "rows", "row_count"]) {
         assert(field in q, `run_1c_query result must still contain ${field}`);
       }
@@ -3241,7 +3255,7 @@ class ContractRunner {
       const zeroMarker = `НЕТ_КОДА_${ts}`;
       const zeroQuery =
         `ВЫБРАТЬ ПЕРВЫЕ 1 Счета.Код КАК ${zeroAlias} ` +
-        `ИЗ ПланСчетов.Хозрасчетный КАК Счета ГДЕ Счета.Код = "${zeroMarker}"`;
+        `ИЗ ${seedSource} КАК Счета ГДЕ Счета.Код = "${zeroMarker}"`;
       const zeroSeed = await okTool(this.client, "run_1c_query", { query: zeroQuery, limit: 1 });
       assert(zeroSeed.row_count === 0, "zero-row seed must return no rows (has_rows=false)");
       // ПЕРВЫЕ 1 отличает пустой шаблон от маркерного (ПЕРВЫЕ 3). Но обезличенный skeleton
@@ -3251,12 +3265,12 @@ class ContractRunner {
       // row_count_max===0 (у сторонней rows-группы он >0; если тот же skeleton где-то вернул
       // строки — группа схлопнется с row_count_max>0 и мы её не выберем => корректный skip),
       // а скрытость проверяем по ТОЧНОМУ совпадению skeleton, а не по общим фрагментам.
-      const ZERO_FRAGS = ["ПланСчетов.Хозрасчетный", "ПЕРВЫЕ 1"];
+      const ZERO_FRAGS = [seedSource, "ПЕРВЫЕ 1"];
       const findZero = (result) =>
         (result.examples || []).find((ex) =>
           ex.row_count_max === 0 && ZERO_FRAGS.every((f) => String(ex.skeleton || "").includes(f)));
       const withoutFilter = await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20, only_with_rows: false });
+        { object: seedSource, days_back: 7, limit: 20, only_with_rows: false });
       const zero = findZero(withoutFilter);
       if (!zero) {
         // Не попал в топ-20 либо тот же skeleton где-то вернул строки — не заваливаем прогон (§11 устойчивость).
@@ -3264,7 +3278,7 @@ class ContractRunner {
       }
       assert(zero.config_version_match !== undefined, "example must carry config_version_match");
       const withFilter = await okTool(this.client, "get_query_examples",
-        { object: "ПланСчетов.Хозрасчетный", days_back: 7, limit: 20 });
+        { object: seedSource, days_back: 7, limit: 20 });
       const stillVisible = (withFilter.examples || []).some((ex) => ex.skeleton === zero.skeleton);
       assert(!stillVisible, "has_rows=false template (row_count_max=0) must be hidden when only_with_rows=true (default)");
       return { verified: true };
@@ -3318,18 +3332,34 @@ class ContractRunner {
 async function findAccountingRegister(client) {
   const result = await okTool(client, "list_metadata_objects", {
     kinds: ["РегистрБухгалтерии"],
-    limit: 1,
+    limit: 10,
     include_details: false,
   });
-  const item = result.objects?.[0];
-  if (!item?.full_name) return null;
-  const [, nameFromFullName = ""] = item.full_name.split(".");
-  const name = item.name || nameFromFullName;
-  if (!name) return null;
-  return {
-    fullName: item.full_name,
-    name,
+  const items = (result.objects ?? []).filter((o) => o?.full_name);
+  if (!items.length) return null;
+  const toRegister = (item) => {
+    const [, nameFromFullName = ""] = item.full_name.split(".");
+    const name = item.name || nameFromFullName;
+    return name ? { fullName: item.full_name, name } : null;
   };
+  // Первый регистр по алфавиту не универсален: в ERP это КорректировкиНалоговойБазы,
+  // у которого ресурса Сумма нет, — и все денежные тесты падали «Поле не найдено
+  // СуммаОстаток» (14 ложных провалов, дефект фикстуры, не сервера). Предпочитаем
+  // регистр, чьи ВТ публикуют СуммаОстаток; состав берём из живого
+  // get_metadata_structure, а не из имён конкретной конфигурации.
+  for (const item of items.slice(0, 5)) {
+    const structure = await rawTool(client, "get_metadata_structure", {
+      type: item.full_name,
+      include_virtual_tables: true,
+    });
+    const vts = structure?.metadata?.register_schema?.virtual_tables || [];
+    const balance = vts.find((v) => v.name === "Остатки")?.common_fields || [];
+    if (balance.includes("СуммаОстаток")) {
+      const register = toRegister(item);
+      if (register) return register;
+    }
+  }
+  return toRegister(items[0]);
 }
 
 async function findAccumulationRegister(client) {
